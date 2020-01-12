@@ -27,7 +27,6 @@ import (
 func (g *generator) genExampleFile(serv *descriptor.ServiceDescriptorProto, pkgName string) error {
 	servName := pbinfo.ReduceServName(*serv.Name, pkgName)
 	p := g.printf
-
 	p("func ExampleNew%sClient() {", servName)
 	g.exampleInitClient(pkgName, servName)
 	p("  // TODO: Use client.")
@@ -35,7 +34,6 @@ func (g *generator) genExampleFile(serv *descriptor.ServiceDescriptorProto, pkgN
 	p("}")
 	p("")
 	g.imports[pbinfo.ImportSpec{Path: "context"}] = true
-
 	for _, m := range serv.Method {
 		if err := g.exampleMethod(pkgName, servName, m); err != nil {
 			return err
@@ -47,11 +45,18 @@ func (g *generator) genExampleFile(serv *descriptor.ServiceDescriptorProto, pkgN
 func (g *generator) exampleInitClient(pkgName, servName string) {
 	p := g.printf
 
-	p("ctx := context.Background()")
-	p("c, err := %s.New%sClient(ctx)", pkgName, servName)
+	p("serverAddr := \"127.0.0.1\"")
+	p("authorizer, err := auth.NewAuthorizerFromEnvironment()")
 	p("if err != nil {")
 	p("  // TODO: Handle error.")
 	p("}")
+
+	p("c, err := %s.New%sClient(&serverAddr, authorizer)", pkgName, servName)
+	p("if err != nil {")
+	p("  // TODO: Handle error.")
+	p("}")
+
+	g.imports[pbinfo.ImportSpec{Path: "github.com/microsoft/wssd-sdk-for-go/pkg/auth"}] = true
 }
 
 func (g *generator) exampleMethod(pkgName, servName string, m *descriptor.MethodDescriptorProto) error {
@@ -72,7 +77,6 @@ func (g *generator) exampleMethod(pkgName, servName string, m *descriptor.Method
 		return err
 	}
 
-	g.imports[inSpec] = true
 
 	p("func Example%sClient_%s() {", servName, m.GetName())
 
@@ -80,14 +84,6 @@ func (g *generator) exampleMethod(pkgName, servName string, m *descriptor.Method
 	if err != nil {
 		return err
 	}
-
-	if *m.OutputType != emptyType {
-		p("// import %s \"%s\"", inSpec.Name, inSpec.Path)
-		if pf == nil {
-			p("")
-		}
-	}
-
 	if pf != nil {
 		p("// import \"google.golang.org/api/iterator\"")
 		p("")
@@ -97,7 +93,7 @@ func (g *generator) exampleMethod(pkgName, servName string, m *descriptor.Method
 
 	if !m.GetClientStreaming() && !m.GetServerStreaming() {
 		p("")
-		p("req := &%s.%s{", inSpec.Name, inType.GetName())
+		p("req := &%s.%s{", pkgName, inType.GetName())
 		p("  // TODO: Fill request struct fields.")
 		p("}")
 	}
@@ -154,6 +150,7 @@ func (g *generator) exampleLROCall(m *descriptor.MethodDescriptorProto) {
 func (g *generator) exampleUnaryCall(m *descriptor.MethodDescriptorProto) {
 	p := g.printf
 
+	p("ctx := context.Background()")
 	p("resp, err := c.%s(ctx, req)", *m.Name)
 	p("if err != nil {")
 	p("  // TODO: Handle error.")

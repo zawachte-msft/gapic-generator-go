@@ -22,7 +22,6 @@ import (
 	"github.com/golang/protobuf/proto"
 	plugin "github.com/golang/protobuf/protoc-gen-go/plugin"
 	"github.com/googleapis/gapic-generator-go/internal/gengapic"
-	"github.com/googleapis/gapic-generator-go/internal/gensample"
 )
 
 func main() {
@@ -39,14 +38,6 @@ func main() {
 	if err != nil {
 		genResp.Error = proto.String(err.Error())
 	}
-
-	sampleResp, err := gensample.PluginEntry(&genReq)
-	if err != nil {
-		sampleResp.Error = proto.String(err.Error())
-	}
-
-	genResp = merge(genResp, sampleResp)
-
 	outBytes, err := proto.Marshal(genResp)
 	if err != nil {
 		log.Fatal(err)

@@ -1,10 +1,12 @@
 .PHONY : check-license test
 
+install:
+	go install ./cmd/protoc-gen-go_gapic
+	go install ./cmd/protoc-gen-go_cli
+	
 image:
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build github.com/googleapis/gapic-generator-go/cmd/protoc-gen-go_gapic
-	docker build -t gcr.io/gapic-images/gapic-generator-go .
-	rm protoc-gen-go_gapic
-
+	
 check-license:
 	find -name '*.go' -not -name '*.pb.go' | xargs go run utils/license.go --
 
@@ -21,10 +23,6 @@ golden:
 test:
 	go test ./...
 	./utils/showcase.bash
-
-install:
-	go install ./cmd/protoc-gen-go_gapic
-	go install ./cmd/protoc-gen-go_cli
 
 clean:
 	rm -rf testdata

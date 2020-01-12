@@ -18,167 +18,12 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/golang/protobuf/proto"
 	"github.com/golang/protobuf/protoc-gen-go/descriptor"
 	"github.com/golang/protobuf/ptypes/duration"
-	conf "github.com/googleapis/gapic-generator-go/internal/grpc_service_config"
 	"github.com/googleapis/gapic-generator-go/internal/pbinfo"
-	"google.golang.org/genproto/googleapis/api/annotations"
+	golangGen "github.com/golang/protobuf/protoc-gen-go/generator"
 )
 
-func (g *generator) clientOptions(serv *descriptor.ServiceDescriptorProto, servName string) error {
-	p := g.printf
-
-	// CallOptions struct
-	{
-		p("// %[1]sCallOptions contains the retry settings for each method of %[1]sClient.", servName)
-		p("type %sCallOptions struct {", servName)
-		for _, m := range serv.Method {
-			p("%s []gax.CallOption", *m.Name)
-		}
-		p("}")
-		p("")
-
-		g.imports[pbinfo.ImportSpec{"gax", "github.com/googleapis/gax-go/v2"}] = true
-	}
-
-	// defaultClientOptions
-	{
-		var host string
-		if eHost, err := proto.GetExtension(serv.Options, annotations.E_DefaultHost); err == nil {
-			host = *eHost.(*string)
-		} else {
-			fqn := g.descInfo.ParentFile[serv].GetPackage() + "." + serv.GetName()
-			return fmt.Errorf("service %q is missing option google.api.default_host", fqn)
-		}
-
-		if !strings.Contains(host, ":") {
-			host += ":443"
-		}
-
-		p("func default%sClientOptions() []option.ClientOption {", servName)
-		p("  return []option.ClientOption{")
-		p("    option.WithEndpoint(%q),", host)
-		p("    option.WithGRPCDialOption(grpc.WithDisableServiceConfig()),")
-		p("    option.WithScopes(DefaultAuthScopes()...),")
-		p("    option.WithGRPCDialOption(grpc.WithDefaultCallOptions(")
-		p("      grpc.MaxCallRecvMsgSize(math.MaxInt32))),")
-		p("  }")
-		p("}")
-		p("")
-
-		g.imports[pbinfo.ImportSpec{Path: "math"}] = true
-		g.imports[pbinfo.ImportSpec{Path: "google.golang.org/api/option"}] = true
-	}
-
-	// defaultCallOptions
-	{
-		sFQN := fmt.Sprintf("%s.%s", g.descInfo.ParentFile[serv].GetPackage(), serv.GetName())
-		policies := map[string]*conf.MethodConfig_RetryPolicy{}
-		reqLimits := map[string]int{}
-		resLimits := map[string]int{}
-
-		var methCfgs []*conf.MethodConfig
-		if g.grpcConf != nil {
-			methCfgs = g.grpcConf.GetMethodConfig()
-		}
-
-		// gather retry policies from MethodConfigs
-		for _, mc := range methCfgs {
-			for _, name := range mc.GetName() {
-				base := name.GetService()
-
-				// skip the Name entry if it's not the current service
-				if base != sFQN {
-					continue
-				}
-
-				// individual method config, overwrites service-level config
-				if name.GetMethod() != "" {
-					base = base + "." + name.GetMethod()
-					policies[base] = mc.GetRetryPolicy()
-
-					if maxReq := mc.GetMaxRequestMessageBytes(); maxReq != nil {
-						reqLimits[base] = int(maxReq.GetValue())
-					}
-
-					if maxRes := mc.GetMaxResponseMessageBytes(); maxRes != nil {
-						resLimits[base] = int(maxRes.GetValue())
-					}
-
-					continue
-				}
-
-				// service-level config, apply to all *unset* methods
-				for _, m := range serv.GetMethod() {
-					// build fully-qualified name
-					fqn := base + "." + m.GetName()
-
-					// set retry config
-					if _, ok := policies[fqn]; !ok {
-						policies[fqn] = mc.GetRetryPolicy()
-					}
-
-					// set max request size limit
-					if maxReq := mc.GetMaxRequestMessageBytes(); maxReq != nil {
-						if _, ok := reqLimits[fqn]; !ok {
-							reqLimits[fqn] = int(maxReq.GetValue())
-						}
-					}
-
-					// set max response size limit
-					if maxRes := mc.GetMaxResponseMessageBytes(); maxRes != nil {
-						if _, ok := resLimits[fqn]; !ok {
-							resLimits[fqn] = int(maxRes.GetValue())
-						}
-					}
-				}
-			}
-		}
-
-		if len(policies) > 0 {
-			g.imports[pbinfo.ImportSpec{Path: "time"}] = true
-			g.imports[pbinfo.ImportSpec{Path: "google.golang.org/grpc/codes"}] = true
-		}
-
-		// read retry params from gRPC ServiceConfig
-		p("func default%[1]sCallOptions() *%[1]sCallOptions {", servName)
-		p("  return &%sCallOptions{", servName)
-		for _, m := range serv.GetMethod() {
-			mFQN := sFQN + "." + m.GetName()
-			p("%s: []gax.CallOption{", m.GetName())
-
-			if maxReq, ok := reqLimits[mFQN]; ok {
-				p("gax.WithGRPCOptions(grpc.MaxCallSendMsgSize(%d)),", maxReq)
-			}
-
-			if maxRes, ok := resLimits[mFQN]; ok {
-				p("gax.WithGRPCOptions(grpc.MaxCallRecvMsgSize(%d)),", maxRes)
-			}
-
-			if rp, ok := policies[mFQN]; ok && rp != nil {
-				p("gax.WithRetry(func() gax.Retryer {")
-				p("  return gax.OnCodes([]codes.Code{")
-				for _, c := range rp.GetRetryableStatusCodes() {
-					p("    codes.%s,", snakeToCamel(c.String()))
-				}
-				p("	 }, gax.Backoff{")
-				// this ignores max_attempts
-				p("		Initial:    %d * time.Millisecond,", durationToMillis(rp.GetInitialBackoff()))
-				p("		Max:        %d * time.Millisecond,", durationToMillis(rp.GetMaxBackoff()))
-				p("		Multiplier: %.2f,", rp.GetBackoffMultiplier())
-				p("	 })")
-				p("}),")
-			}
-			p("},")
-		}
-		p("  }")
-		p("}")
-		p("")
-	}
-
-	return nil
-}
 
 func durationToMillis(d *duration.Duration) int64 {
 	return d.GetSeconds()*1000 + int64(d.GetNanos()/1000000)
@@ -187,18 +32,11 @@ func durationToMillis(d *duration.Duration) int64 {
 func (g *generator) clientInit(serv *descriptor.ServiceDescriptorProto, servName string) error {
 	p := g.printf
 
-	var hasLRO bool
-	for _, m := range serv.Method {
-		if *m.OutputType == lroType {
-			hasLRO = true
-			break
-		}
-	}
-
 	imp, err := g.descInfo.ImportSpec(serv)
 	if err != nil {
 		return err
 	}
+
 
 	// client struct
 	{
@@ -215,27 +53,11 @@ func (g *generator) clientInit(serv *descriptor.ServiceDescriptorProto, servName
 		p("%s %s.%sClient", grpcClientField(servName), imp.Name, serv.GetName())
 		p("")
 
-		if hasLRO {
-			p("// LROClient is used internally to handle longrunning operations.")
-			p("// It is exposed so that its CallOptions can be modified if required.")
-			p("// Users should not Close this client.")
-			p("LROClient *lroauto.OperationsClient")
-			p("")
-
-			g.imports[pbinfo.ImportSpec{Name: "lroauto", Path: "cloud.google.com/go/longrunning/autogen"}] = true
-		}
-
-		p("// The call options for this service.")
-		p("CallOptions *%sCallOptions", servName)
-		p("")
-
-		p("// The x-goog-* metadata to be sent with each request.")
-		p("xGoogMetadata metadata.MD")
 		p("}")
 		p("")
 
 		g.imports[pbinfo.ImportSpec{Path: "google.golang.org/grpc"}] = true
-		g.imports[pbinfo.ImportSpec{Path: "google.golang.org/grpc/metadata"}] = true
+
 	}
 
 	// Client constructor
@@ -246,39 +68,26 @@ func (g *generator) clientInit(serv *descriptor.ServiceDescriptorProto, servName
 		p("// New%sClient creates a new %s client.", servName, clientName)
 		p("//")
 		g.comment(g.comments[serv])
-		p("func New%[1]sClient(ctx context.Context, opts ...option.ClientOption) (*%[1]sClient, error) {", servName)
-		p("  conn, err := transport.DialGRPC(ctx, append(default%sClientOptions(), opts...)...)", servName)
+		p("func New%[1]sClient(serverAddress *string, authorizer auth.Authorizer) (*%[1]sClient, error) {", servName)
+		p("  opts := helper.GetDefaultDialOption(authorizer)")
+		p("  conn, err := grpc.Dial(helper.GetServerEndpoint(serverAddress), opts...)")
 		p("  if err != nil {")
-		p("    return nil, err")
+		p("    klog.Fatalf(\"Unable to get %[1]sClient. Failed to dial the server\")", servName)
 		p("  }")
 		p("  c := &%sClient{", servName)
 		p("    conn:        conn,")
-		p("    CallOptions: default%sCallOptions(),", servName)
-		p("")
 		p("    %s: %s.New%sClient(conn),", grpcClientField(servName), imp.Name, serv.GetName())
 		p("  }")
-		p("  c.setGoogleClientInfo()")
 		p("")
-
-		if hasLRO {
-			p("  c.LROClient, err = lroauto.NewOperationsClient(ctx, option.WithGRPCConn(conn))")
-			p("  if err != nil {")
-			p("    // This error \"should not happen\", since we are just reusing old connection")
-			p("    // and never actually need to dial.")
-			p("    // If this does happen, we could leak conn. However, we cannot close conn:")
-			p("    // If the user invoked the function with option.WithGRPCConn,")
-			p("    // we would close a connection that's still in use.")
-			p("    // TODO(pongad): investigate error conditions.")
-			p("    return nil, err")
-			p("  }")
-		}
 
 		p("  return c, nil")
 		p("}")
 		p("")
 
-		g.imports[pbinfo.ImportSpec{Path: "google.golang.org/api/transport"}] = true
-		g.imports[pbinfo.ImportSpec{Path: "context"}] = true
+		g.imports[pbinfo.ImportSpec{Path: "github.com/microsoft/wssd-sdk-for-go/pkg/auth"}] = true
+		g.imports[pbinfo.ImportSpec{Path: "github.com/microsoft/nodesdk/helper"}] = true
+		g.imports[pbinfo.ImportSpec{Path: "k8s.io/klog"}] = true
+
 	}
 
 	// Connection()
@@ -299,19 +108,187 @@ func (g *generator) clientInit(serv *descriptor.ServiceDescriptorProto, servName
 		p("}")
 		p("")
 	}
+	
+	return nil
+}
 
-	// setGoogleClientInfo
-	{
-		p("// setGoogleClientInfo sets the name and version of the application in")
-		p("// the `x-goog-api-client` header passed on each request. Intended for")
-		p("// use by Google-written clients.")
-		p("func (c *%sClient) setGoogleClientInfo(keyval ...string) {", servName)
-		p(`  kv := append([]string{"gl-go", versionGo()}, keyval...)`)
-		p(`  kv = append(kv, "gapic", versionClient, "gax", gax.Version, "grpc", grpc.Version)`)
-		p(`  c.xGoogMetadata = metadata.Pairs("x-goog-api-client", gax.XGoogHeader(kv...))`)
+func (g *generator) transformersInit() error {
+	p := g.printf
+
+	for kh,v := range g.sdkmapin {
+		s := v.(map[interface{}]interface{})
+		
+		topMethod := fmt.Sprintf("get%s", kh)
+		itemList := []ItemSdk{ ItemSdk{
+			mapPart : s,
+			name : kh,
+			isRepeated: getMetaData(s["metadata"]).isRepeated,
+			functionName: topMethod,
+		}}
+		stringPath := strings.Split(getMetaData(s["metadata"]).inSpec, ";")
+		inSpec := stringPath[0]
+
+		g.imports[pbinfo.ImportSpec{Name: stringPath[0], Path: stringPath[1]}] = true
+		
+		count := 0
+		for  {
+			if itemList[count].inSpec != "" {
+				inSpec = itemList[count].inSpec
+			}
+			if itemList[count].isRepeated {
+				itemList = append(itemList, g.generateTransFormerRepeated(itemList[count].mapPart, itemList[count].functionName, inSpec, itemList[count].name)...)
+			} else if itemList[count].isEnum {
+				g.generateTransFormerEnum(itemList[count].mapPart, itemList[count].functionName, inSpec, itemList[count].name)
+			} else {
+				itemList = append(itemList, g.generateTransFormer(itemList[count].mapPart, itemList[count].functionName, inSpec, itemList[count].name)...)
+			}
+			if count >= len(itemList) -1 {
+				break
+			}
+			count++;
+		}
+	}
+
+	for kh,v := range g.sdkmapout {
+		s := v.(map[interface{}]interface{})
+		
+		sdkMapping := getMetaData(s["metadata"]).mapping
+		topMethod := fmt.Sprintf("getSDK%s", kh)
+		sdkNameSingle := strings.TrimSuffix(kh, "s")
+
+		nextUp := s[kh].(map[interface{}]interface{})
+
+		stringPath := strings.Split(getMetaData(s["metadata"]).inSpec, ";")
+		inSpec := stringPath[0]
+
+		p("func get%sFromResponse(response *%s.%s) []*%s {", kh, inSpec, sdkMapping, sdkNameSingle)
+			p("return getSDK%s(response.%s)", kh, kh)
+		p("}")
+ 
+		itemList := []ItemSdk{ ItemSdk{
+				mapPart : nextUp,
+				name : kh,
+				isRepeated: true,
+				functionName: topMethod,
+			}}
+		count := 0
+		for  {
+			if itemList[count].inSpec != "" {
+				inSpec = itemList[count].inSpec
+			}
+			if itemList[count].isRepeated {
+				itemList = append(itemList, g.generateTransFormerRepeatedOut(itemList[count].mapPart, itemList[count].functionName, inSpec, itemList[count].name)...)
+			} else {
+				itemList = append(itemList, g.generateTransFormerOut(itemList[count].mapPart, itemList[count].functionName, inSpec, itemList[count].name)...)
+			}
+			if count >= len(itemList) -1 {
+				break
+			}
+			count++;
+		}
+	}
+	return nil
+}
+
+func (g *generator) clientInitStruct(servName string, messages []*descriptor.DescriptorProto, enums []*descriptor.EnumDescriptorProto, outDir string) error {
+	p := g.printf
+
+	for _, message := range messages {
+		p("type %s struct {", message.GetName())
+		for _, field := range message.GetField() {
+			typ, _ := g.GoType(field, servName, outDir)
+			p("	%s			%s", golangGen.CamelCase(field.GetName()), typ)
+		}
 		p("}")
 		p("")
 	}
 
+	for _, enu := range enums {
+		
+		p("type %s int32", enu.GetName())
+		p("const (")
+		for i, v := range enu.GetValue() {
+			p(" %s_%s %s = %v", enu.GetName(), v.GetName(), enu.GetName(), i)
+		}
+		p(")")
+		p("")
+
+		
+	}
+
 	return nil
+}
+
+
+// GoType returns a string representing the type name, and the wire type
+func (g *generator) GoType(field *descriptor.FieldDescriptorProto, pkgName string, outDir string) (typ string, wire string) {
+	// TODO: Options.
+	switch *field.Type {
+	case descriptor.FieldDescriptorProto_TYPE_DOUBLE:
+		typ, wire = "float64", "fixed64"
+	case descriptor.FieldDescriptorProto_TYPE_FLOAT:
+		typ, wire = "float32", "fixed32"
+	case descriptor.FieldDescriptorProto_TYPE_INT64:
+		typ, wire = "int64", "varint"
+	case descriptor.FieldDescriptorProto_TYPE_UINT64:
+		typ, wire = "uint64", "varint"
+	case descriptor.FieldDescriptorProto_TYPE_INT32:
+		typ, wire = "int32", "varint"
+	case descriptor.FieldDescriptorProto_TYPE_UINT32:
+		typ, wire = "uint32", "varint"
+	case descriptor.FieldDescriptorProto_TYPE_FIXED64:
+		typ, wire = "uint64", "fixed64"
+	case descriptor.FieldDescriptorProto_TYPE_FIXED32:
+		typ, wire = "uint32", "fixed32"
+	case descriptor.FieldDescriptorProto_TYPE_BOOL:
+		typ, wire = "bool", "varint"
+	case descriptor.FieldDescriptorProto_TYPE_STRING:
+		typ, wire = "string", "bytes"
+	case descriptor.FieldDescriptorProto_TYPE_GROUP:
+		desc := g.ga.ObjectNamed(field.GetTypeName())
+		typ, wire = "*"+g.ga.TypeName(desc), "group"
+	case descriptor.FieldDescriptorProto_TYPE_MESSAGE:
+		desc := g.ga.ObjectNamed(field.GetTypeName())
+
+		path, err := checkIfLocalPath(string(desc.GoImportPath()), pkgName, outDir)
+		if err == nil {
+			g.imports[pbinfo.ImportSpec{Path: path}] = true
+		}
+		typ, wire = "*"+ g.ga.TypeName(desc), "bytes"
+	case descriptor.FieldDescriptorProto_TYPE_BYTES:
+		typ, wire = "[]byte", "bytes"
+	case descriptor.FieldDescriptorProto_TYPE_ENUM:
+		desc := g.ga.ObjectNamed(field.GetTypeName())
+		typ, wire = g.ga.TypeName(desc), "varint"
+	case descriptor.FieldDescriptorProto_TYPE_SFIXED32:
+		typ, wire = "int32", "fixed32"
+	case descriptor.FieldDescriptorProto_TYPE_SFIXED64:
+		typ, wire = "int64", "fixed64"
+	case descriptor.FieldDescriptorProto_TYPE_SINT32:
+		typ, wire = "int32", "zigzag32"
+	case descriptor.FieldDescriptorProto_TYPE_SINT64:
+		typ, wire = "int64", "zigzag64"
+	default:
+	}
+	if isRepeated(field) {
+		typ = "[]" + typ
+	}
+
+	return
+}
+
+// Is this field repeated?
+func isRepeated(field *descriptor.FieldDescriptorProto) bool {
+	return field.Label != nil && *field.Label == descriptor.FieldDescriptorProto_LABEL_REPEATED
+}
+
+func checkIfLocalPath(path string, pkgName string, outDir string) (string, error) {
+	if strings.Contains(path, "wssd") {
+		test := strings.Split(path, "/")
+		if test[len(test) - 1] == pkgName {
+			return "", fmt.Errorf("Dupe")
+		}
+		return outDir + "/" + test[len(test) - 1], nil
+	}
+	return path, nil
 }

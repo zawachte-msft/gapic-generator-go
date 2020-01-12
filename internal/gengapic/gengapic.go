@@ -16,8 +16,9 @@ package gengapic
 
 import (
 	"fmt"
-	"net/url"
+	//"net/url"
 	"os"
+	"io/ioutil"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -38,6 +39,8 @@ import (
 	"github.com/googleapis/gapic-generator-go/internal/pbinfo"
 	"github.com/googleapis/gapic-generator-go/internal/printer"
 	"google.golang.org/genproto/googleapis/api/annotations"
+	protogen "github.com/golang/protobuf/protoc-gen-go/generator"
+
 )
 
 const (
@@ -56,7 +59,7 @@ const (
 var headerParamRegexp = regexp.MustCompile(`{([_.a-z]+)=`)
 
 func Gen(genReq *plugin.CodeGeneratorRequest) (*plugin.CodeGeneratorResponse, error) {
-	var pkgPath, pkgName, outDir string
+	var pkgPath, pkgName, outDir, outRoot string
 	var g generator
 
 	if genReq.Parameter == nil {
@@ -80,6 +83,8 @@ func Gen(genReq *plugin.CodeGeneratorRequest) (*plugin.CodeGeneratorResponse, er
 			pkgPath = s[e+1 : p]
 			pkgName = s[p+1:]
 			outDir = filepath.FromSlash(pkgPath)
+			pr := strings.LastIndexByte(outDir, '/')
+			outRoot = outDir[:pr]
 		case "gapic-service-config":
 			f, err := os.Open(s[e+1:])
 			if err != nil {
@@ -101,8 +106,28 @@ func Gen(genReq *plugin.CodeGeneratorRequest) (*plugin.CodeGeneratorResponse, er
 			if err != nil {
 				return &g.resp, errors.E(nil, "error unmarshaling gPRC service config: %v", err)
 			}
-		case "release-level":
-			g.relLvl = strings.ToLower(s[e+1:])
+		case "sdk-mapping-in":
+			f, err := ioutil.ReadFile(s[e+1:])
+			if err != nil {
+				return &g.resp, errors.E(nil, "error opening service config: %v", err)
+			}
+
+			g.sdkmapin = make(map[string]interface{})
+			err = yaml.Unmarshal(f, &g.sdkmapin)
+			if err != nil {
+				return &g.resp, errors.E(nil, "error yaml yaml: %v", err)
+			}
+		case "sdk-mapping-out":
+			f, err := ioutil.ReadFile(s[e+1:])
+			if err != nil {
+				return &g.resp, errors.E(nil, "error opening service config: %v", err)
+			}
+
+			g.sdkmapout = make(map[string]interface{})
+			err = yaml.Unmarshal(f, &g.sdkmapout)
+			if err != nil {
+				return &g.resp, errors.E(nil, "error yaml yaml: %v", err)
+			}
 		case "sample-only":
 			return &g.resp, nil
 		}
@@ -112,13 +137,34 @@ func Gen(genReq *plugin.CodeGeneratorRequest) (*plugin.CodeGeneratorResponse, er
 		return &g.resp, errors.E(nil, paramError)
 	}
 
+	ga := protogen.New()
+	ga.CommandLineParameters(*genReq.Parameter)
+	ga.Request = genReq
+	ga.WrapTypes()
+	ga.SetPackageNames()
+	ga.BuildTypeNameMap()
+	ga.GenerateAllFiles()
+	g.ga = ga
+
 	g.init(genReq.ProtoFile)
 
 	var genServs []*descriptor.ServiceDescriptorProto
+	var enumToEnum []*descriptor.EnumDescriptorProto
+	var structsToStruct []*descriptor.DescriptorProto
 	for _, f := range genReq.ProtoFile {
+
 		if !strContains(genReq.FileToGenerate, f.GetName()) {
 			continue
 		}
+
+		for _, struc := range f.GetMessageType() {
+			structsToStruct = append(structsToStruct, struc)
+		}
+
+		for _, en := range f.GetEnumType() {
+			enumToEnum = append(enumToEnum, en)
+		}
+
 		genServs = append(genServs, f.Service...)
 	}
 
@@ -128,30 +174,42 @@ func Gen(genReq *plugin.CodeGeneratorRequest) (*plugin.CodeGeneratorResponse, er
 		g.apiName = g.serviceConfig.Title
 	}
 
+	if err := g.genStruct(pkgName, structsToStruct, enumToEnum, outRoot); err != nil {
+		return &g.resp, err
+	}
+
+	g.commit(filepath.Join(outDir, pkgName + ".go"), pkgName)
+	g.reset()
+
+	if err := g.transformersInit(); err != nil {
+		return &g.resp, err
+	}
+
+	g.commit(filepath.Join(outDir, pkgName + "_transformers.go"), pkgName)
+	g.reset()
+
 	for _, s := range genServs {
-		// TODO(pongad): gapic-generator does not remove the package name here,
-		// so even though the client for LoggingServiceV2 is just "Client"
-		// the file name is "logging_client.go".
-		// Keep the current behavior for now, but we could revisit this later.
 		outFile := pbinfo.ReduceServName(s.GetName(), "")
 		outFile = camelToSnake(outFile)
 		outFile = filepath.Join(outDir, outFile)
 
-		g.reset()
-		if err := g.gen(s, pkgName); err != nil {
+
+
+		if err := g.genService(s, pkgName); err != nil {
 			return &g.resp, err
 		}
 		g.commit(outFile+"_client.go", pkgName)
-
 		g.reset()
+
 		if err := g.genExampleFile(s, pkgName); err != nil {
 			return &g.resp, errors.E(err, "example: %s", s.GetName())
 		}
 		g.imports[pbinfo.ImportSpec{Name: pkgName, Path: pkgPath}] = true
 		g.commit(outFile+"_client_example_test.go", pkgName+"_test")
+		g.reset()
 	}
-
 	g.reset()
+
 	scopes, err := collectScopes(genServs, g.serviceConfig)
 	if err != nil {
 		return &g.resp, err
@@ -200,10 +258,17 @@ type generator struct {
 
 	// Release level that defaults to GA/nothing
 	relLvl string
+
+	ga *protogen.Generator
+
+	sdkmapin map[string]interface{}
+	sdkmapout map[string]interface{}
+	funcMap map[string]bool
 }
 
 func (g *generator) init(files []*descriptor.FileDescriptorProto) {
 	g.descInfo = pbinfo.Of(files)
+	g.funcMap = make(map[string]bool)
 
 	g.comments = map[proto.Message]string{}
 	g.imports = map[pbinfo.ImportSpec]bool{}
@@ -251,9 +316,8 @@ func (g *generator) printf(s string, a ...interface{}) {
 
 func (g *generator) commit(fileName, pkgName string) {
 	var header strings.Builder
-	fmt.Fprintf(&header, license.Apache, time.Now().Year())
+	fmt.Fprintf(&header, license.MIT)
 	fmt.Fprintf(&header, "package %s\n\n", pkgName)
-
 	var imps []pbinfo.ImportSpec
 	for imp := range g.imports {
 		imps = append(imps, imp)
@@ -312,31 +376,28 @@ func (g *generator) reset() {
 }
 
 // gen generates client for the given service.
-func (g *generator) gen(serv *descriptor.ServiceDescriptorProto, pkgName string) error {
-	servName := pbinfo.ReduceServName(*serv.Name, pkgName)
-	if err := g.clientOptions(serv, servName); err != nil {
-		return err
+func (g *generator) genStruct(pkgName string, messages []*descriptor.DescriptorProto, enums []*descriptor.EnumDescriptorProto, outDir string) error {
+	// servName := pbinfo.ReduceServName(*serv.Name, pkgName)
+	
+	if err := g.clientInitStruct(pkgName, messages, enums, outDir); err != nil {
+		return nil
 	}
+
+	return nil
+}
+
+// gen generates client for the given service.
+func (g *generator) genService(serv *descriptor.ServiceDescriptorProto, pkgName string) error {
+	servName := pbinfo.ReduceServName(*serv.Name, pkgName)
+	
 	if err := g.clientInit(serv, servName); err != nil {
 		return err
 	}
-
-	// clear LRO types between services
-	g.aux.lros = []*descriptor.MethodDescriptorProto{}
-
 	for _, m := range serv.Method {
 		g.methodDoc(m)
+
 		if err := g.genMethod(servName, serv, m); err != nil {
 			return errors.E(err, "method: %s", m.GetName())
-		}
-	}
-
-	sort.Slice(g.aux.lros, func(i, j int) bool {
-		return g.aux.lros[i].GetName() < g.aux.lros[j].GetName()
-	})
-	for _, m := range g.aux.lros {
-		if err := g.lroType(servName, serv, m); err != nil {
-			return err
 		}
 	}
 
@@ -365,9 +426,6 @@ func (g *generator) gen(serv *descriptor.ServiceDescriptorProto, pkgName string)
 
 // auxTypes gathers details of types we need to generate along with the client
 type auxTypes struct {
-	// List of LRO methods. For each method "Foo", we use this to create the "FooOperation" type.
-	lros []*descriptor.MethodDescriptorProto
-
 	// "List" of iterator types. We use these to generate FooIterator returned by paging methods.
 	// Since multiple methods can page over the same type, we dedupe by the name of the iterator,
 	// which is in turn determined by the element type name.
@@ -377,14 +435,6 @@ type auxTypes struct {
 // genMethod generates a single method from a client. m must be a method declared in serv.
 // If the generated method requires an auxillary type, it is added to aux.
 func (g *generator) genMethod(servName string, serv *descriptor.ServiceDescriptorProto, m *descriptor.MethodDescriptorProto) error {
-	if m.GetOutputType() == lroType {
-		g.aux.lros = append(g.aux.lros, m)
-		return g.lroCall(servName, m)
-	}
-
-	if m.GetOutputType() == emptyType {
-		return g.emptyUnaryCall(servName, m)
-	}
 
 	if pf, err := g.pagingField(m); err != nil {
 		return err
@@ -422,106 +472,31 @@ func (g *generator) unaryCall(servName string, m *descriptor.MethodDescriptorPro
 
 	p := g.printf
 
-	p("func (c *%sClient) %s(ctx context.Context, req *%s.%s, opts ...gax.CallOption) (*%s.%s, error) {",
-		servName, *m.Name, inSpec.Name, inType.GetName(), outSpec.Name, outType.GetName())
+	p("func (c *%sClient) %s(ctx context.Context, req *%s) ([]*%s, error) {",
+		servName, *m.Name, inType.GetName(), outType.GetName())
 
-	err = g.insertMetadata(m)
-	if err != nil {
-		return err
-	}
+	p("request := get%sRequest(req)", inType.GetName())
+	p("response, err := %s", grpcClientCall(servName, *m.Name))
 
-	g.appendCallOpts(m)
-	p("var resp *%s.%s", outSpec.Name, outType.GetName())
-	p("err := gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {")
-	p("  var err error")
-	p("  resp, err = %s", grpcClientCall(servName, *m.Name))
-	p("  return err")
-	p("}, opts...)")
 	p("if err != nil {")
 	p("  return nil, err")
 	p("}")
-	p("return resp, nil")
+
+	p("return get%ssFromResponse(response), nil", inType.GetName())
 
 	p("}")
 	p("")
+
+//	p("func protoToClient (resp interface{})  *%s {", outType.GetName())
+//	p("	respClient, ok := resp.(*%s)", outType.GetName())
+//	p("	if !ok {")
+//	p("	}")
+//	p("	return respClient")
+//	p("}")
 
 	g.imports[inSpec] = true
 	g.imports[outSpec] = true
-
-	return nil
-}
-
-func (g *generator) emptyUnaryCall(servName string, m *descriptor.MethodDescriptorProto) error {
-	inType := g.descInfo.Type[*m.InputType]
-
-	inSpec, err := g.descInfo.ImportSpec(inType)
-	if err != nil {
-		return err
-	}
-
-	p := g.printf
-
-	p("func (c *%sClient) %s(ctx context.Context, req *%s.%s, opts ...gax.CallOption) error {",
-		servName, m.GetName(), inSpec.Name, inType.GetName())
-
-	err = g.insertMetadata(m)
-	if err != nil {
-		return err
-	}
-
-	g.appendCallOpts(m)
-	p("err := gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {")
-	p("  var err error")
-	p("  _, err = %s", grpcClientCall(servName, m.GetName()))
-	p("  return err")
-	p("}, opts...)")
-	p("return err")
-
-	p("}")
-	p("")
-
-	g.imports[inSpec] = true
-	return nil
-}
-
-func (g *generator) insertMetadata(m *descriptor.MethodDescriptorProto) error {
-	headers, err := parseRequestHeaders(m)
-	if err != nil {
-		return err
-	}
-
-	if len(headers) > 0 {
-		seen := map[string]bool{}
-		var formats, values strings.Builder
-		for _, h := range headers {
-			field := h[1]
-			// skip fields that have multiple patterns, they use the same accessor
-			if _, dupe := seen[field]; dupe {
-				continue
-			}
-			seen[field] = true
-
-			// URL encode key & values separately per aip.dev/4222.
-			// Encode the key ahead of time to reduce clutter
-			// and because it will likely never be necessary
-			fmt.Fprintf(&values, " %q, url.QueryEscape(req%s),",
-				url.QueryEscape(field), buildAccessor(field))
-			formats.WriteString("%s=%v&")
-		}
-		f := formats.String()[:formats.Len()-1]
-		v := values.String()[:values.Len()-1]
-
-		g.printf("md := metadata.Pairs(\"x-goog-request-params\", fmt.Sprintf(%q,%s))", f, v)
-		g.printf("ctx = insertMetadata(ctx, c.xGoogMetadata, md)")
-
-		g.imports[pbinfo.ImportSpec{Path: "fmt"}] = true
-		g.imports[pbinfo.ImportSpec{Path: "net/url"}] = true
-
-		return nil
-	}
-
-	g.printf("ctx = insertMetadata(ctx, c.xGoogMetadata)")
-
+	g.imports[pbinfo.ImportSpec{Path: "context"}] = true
 	return nil
 }
 
@@ -532,10 +507,6 @@ func buildAccessor(field string) string {
 		fmt.Fprintf(&ax, ".Get%s()", snakeToCamel(s))
 	}
 	return ax.String()
-}
-
-func (g *generator) appendCallOpts(m *descriptor.MethodDescriptorProto) {
-	g.printf("opts = append(%[1]s[0:len(%[1]s):len(%[1]s)], opts...)", "c.CallOptions."+*m.Name)
 }
 
 func (g *generator) methodDoc(m *descriptor.MethodDescriptorProto) {
@@ -577,7 +548,7 @@ func grpcClientField(reducedServName string) string {
 }
 
 func grpcClientCall(reducedServName, methName string) string {
-	return fmt.Sprintf("c.%s.%s(ctx, req, settings.GRPC...)", grpcClientField(reducedServName), methName)
+	return fmt.Sprintf("c.%s.%s(ctx, request)", grpcClientField(reducedServName), methName)
 }
 
 func lowerFirst(s string) string {

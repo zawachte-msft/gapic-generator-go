@@ -32,7 +32,7 @@ import (
 func (g *generator) genDocFile(pkgPath, pkgName string, year int, scopes []string) {
 	p := g.printf
 
-	p(license.Apache, year)
+	p(license.MIT)
 	p("")
 
 	if g.apiName != "" {
